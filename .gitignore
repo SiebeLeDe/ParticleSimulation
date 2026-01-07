@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+
+# Output files
+*.csv
+*.h5
+*.hdf5
