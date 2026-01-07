@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Protocol, Sequence, Callable
+from typing import Mapping, Protocol, Sequence, Callable
 from enum import Enum
 import pathlib as pl
 import numpy as np
@@ -19,7 +19,7 @@ import cProfile
 
 
 class FileHandler(Protocol):
-    def save_state(self, filename: str | pl.Path, data: dict[str, Sequence[float] | npt.NDArray]) -> None: ...
+    def save_state(self, filename: str | pl.Path, data: Mapping[str, Sequence[float] | npt.NDArray]) -> None: ...
 
     def load_state(self, filename: str | pl.Path) -> tuple[npt.NDArray, ...]: ...
 
@@ -32,7 +32,7 @@ class FileHandlerType(StrEnum):
 class CSVFileHandler:
     header = ["x_pos", "y_pos", "x_vel", "y_vel", "radius", "mass"]
 
-    def save_state(self, filename: str | pl.Path, data: dict[str, Sequence[float] | npt.NDArray]) -> None:
+    def save_state(self, filename: str | pl.Path, data: Mapping[str, Sequence[float] | npt.NDArray]) -> None:
         file = pl.Path(filename).with_suffix(".csv")
         with open(file, "w") as f:
             f.write(",".join(self.header) + "\n")
@@ -57,11 +57,11 @@ class CSVFileHandler:
                 values = line.strip().split(",")
                 for key, value in zip(self.header, values):
                     data[key].append(float(value))
-        return {key: np.array(value) for key, value in data.items()}
+        return tuple(np.array(value) for value in data.values())
 
 
 class HDF5FileHandler:
-    def save_state(self, filename: str | pl.Path, data: dict[str, Sequence[float] | npt.NDArray]) -> None:
+    def save_state(self, filename: str | pl.Path, data: Mapping[str, Sequence[float] | npt.NDArray]) -> None:
         file = pl.Path(filename).with_suffix(".h5")
         with h5py.File(file, "w") as f:
             for key, value in data.items():
@@ -72,7 +72,7 @@ class HDF5FileHandler:
         file = pl.Path(filename).with_suffix(".h5")
         with h5py.File(file, "r") as f:
             for key in f.keys():
-                data[key] = f[key][:]
+                data[key] = f[key][:]  # type: ignore
         return tuple(data.values())
 
 
@@ -106,7 +106,9 @@ def get_collision_pairs_distance_squared(positions: npt.NDArray, radii: npt.NDAr
     num_particles = positions.shape[0]
     for i in range(num_particles):
         for j in range(i + 1, num_particles):
-            dist_sq = np.sum((positions[i] - positions[j]) ** 2)
+            x_diff = positions[i, 0] - positions[j, 0]
+            y_diff = positions[i, 1] - positions[j, 1]
+            dist_sq = x_diff**2 + y_diff**2
             radius_sum = radii[i] + radii[j]
             if dist_sq < radius_sum**2:
                 collisions.append((i, j))
@@ -146,7 +148,7 @@ _resolve_collision_register: dict[int, Callable[[npt.NDArray, npt.NDArray, npt.N
 
 @dataclass
 class SimulationConfig:
-    NUM_PARTICLES: int = 200
+    NUM_PARTICLES: int = 1000
     BOX_SIZE: float = 1.0
     DT: float = 0.01
     MIN_RADIUS: float = 0.005
@@ -207,7 +209,7 @@ class ParticleSimulation:
         self.file_counter: int = 0
 
         # Dependency injections for file handling and collision solving
-        self.file_handler: FileHandler = _file_handler_register[config.FILE_HANDLER_TYPE]()
+        self.file_handler: FileHandler = _file_handler_register[config.FILE_HANDLER_TYPE]
         self.pair_solver: Callable[[npt.NDArray, npt.NDArray], list[tuple[int, int]]] = _collision_pair_finder_register[config.PAIR_SOLVER]
         self.collision_solver: Callable[[npt.NDArray, npt.NDArray, npt.NDArray, int, int], None] = _resolve_collision_register[config.COLLISION_RESOLVER]
 
@@ -378,7 +380,9 @@ class ParticleSimulation:
         :rtype: tuple
         """
         self.move(step)
-        self.particles.set_offsets(self.positions)
+
+        if self.particles is not None:
+            self.particles.set_offsets(self.positions)
         return (self.particles,)
 
     def run_simulation(self, num_steps: int, animate: bool = False) -> None:
@@ -410,7 +414,7 @@ class ParticleSimulation:
             )
             ani = animation.FuncAnimation(
                 fig,
-                self.update_animation,
+                self.update_animation,  # type: ignore
                 frames=num_steps,
                 interval=20,
                 blit=True,
@@ -454,40 +458,32 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Particle collision simulation")
     # Add arguments
-    parser.add_argument(
-        "--animate",
-        type=str,
-        required=True,
-        help="1 if simulations should be animated, 0 otherwise",
-    )
-    parser.add_argument(
-        "--file_handler",
-        type=str,
-        required=False,
-        default="CSV",
-        help="Type of file handler to use: CSV or HDF5"
-    )
-    parser.add_argument(
-        "--pair_solver",
-        type=str,
-        required=False,
-        default="NUMPY_NORM",
-        help="Algorithm to use for collision pair finding: NUMPY_NORM or DISTANCE_SQUARED"
-    )
+    parser.add_argument("--animate", type=str, required=False, help="1 if simulations should be animated, 0 otherwise")
+    parser.add_argument("--file_handler", type=str, required=False, default="HDF5", help="Type of file handler to use: CSV or HDF5")
+    parser.add_argument("--pair_solver", type=str, required=False, default="DISTANCE_SQUARED", help="Algorithm to use for collision pair finding: NUMPY_NORM or DISTANCE_SQUARED")
     args = parser.parse_args()
 
     config = SimulationConfig()
 
     # -----------------------------------------------------------------------------------------
+    # Animation
+    # -----------------------------------------------------------------------------------------
+
+    ANIMATE = True
+
+    # -----------------------------------------------------------------------------------------
     # Select file handler based on argument
     # -----------------------------------------------------------------------------------------
 
-    _file_handler_register[FileHandlerType.CSV] = CSVFileHandler
-    _file_handler_register[FileHandlerType.HDF5] = HDF5FileHandler
+    _file_handler_register[FileHandlerType.CSV] = CSVFileHandler()
+    _file_handler_register[FileHandlerType.HDF5] = HDF5FileHandler()
 
     if args.file_handler.upper() not in FileHandlerType.__members__:
         print(f"Error! Unknown file handler type: {args.file_handler}")
         exit(1)
+
+    config.FILE_HANDLER_TYPE = FileHandlerType[args.file_handler.upper()]
+    config.WRITE_STATE = True
 
     # -----------------------------------------------------------------------------------------
     # Select collision solver iteration based on argument
@@ -500,18 +496,17 @@ def main():
         print(f"Error! Unknown collision pair solver algorithm: {args.pair_solver}")
         exit(1)
 
-    # -----------------------------------------------------------------------------------------
-    # Select file handler based on argument
-    # -----------------------------------------------------------------------------------------
+    config.PAIR_SOLVER = CollisionCheckerAlgorithm[args.pair_solver.upper()]
 
-    config.FILE_HANDLER_TYPE = FileHandlerType[args.file_handler.upper()]
-    config.WRITE_STATE = True
+    # -----------------------------------------------------------------------------------------
+    # Run the simulation
+    # -----------------------------------------------------------------------------------------
 
     # Log the configuration to the console
     log_simulation_config(config)
     with ParticleSimulation(config=config) as simulation:
         simulation.initialize_particles()
-        simulation.run_simulation(num_steps=100, animate=args.animate == "1")
+        simulation.run_simulation(num_steps=100, animate=ANIMATE)
 
 
 if __name__ == "__main__":
