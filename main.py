@@ -11,7 +11,7 @@ import argparse
 from dataclasses import dataclass
 import numpy.typing as npt
 import h5py
-import cProfile
+import psutil
 
 # =============================================================================================================
 # File handlers (including the protocol) for saving and loading simulation state
@@ -86,9 +86,20 @@ _file_handler_register: dict[FileHandlerType, FileHandler] = {}
 class CollisionCheckerAlgorithm(Enum):
     NUMPY_NORM = 1
     DISTANCE_SQUARED = 2
+    NEIGHBOR_LIST = 3
 
 
-def get_collision_pairs_numpy_norm(positions: npt.NDArray, radii: npt.NDArray) -> list[tuple[int, int]]:
+def _compare_positions_and_radii(pos1: npt.NDArray, pos2: npt.NDArray, radius1: float, radius2: float) -> float:
+    """Small helper function to compare two positions and determine if they are colliding."""
+    x_diff = pos1[0] - pos2[0]
+    y_diff = pos1[1] - pos2[1]
+    dist_sq = x_diff**2 + y_diff**2
+    radius_sum = radius1 + radius2
+
+    return dist_sq < radius_sum**2
+
+
+def get_collision_pairs_numpy_norm(positions: npt.NDArray, radii: npt.NDArray, **_) -> list[tuple[int, int]]:
     """Orgininal implementation using np.linalg.norm to compute distances. This method is very inefficient for small radii, but very powerful for large arrays due to numpy optimizations."""
     collisions = []
     num_particles = positions.shape[0]
@@ -100,18 +111,65 @@ def get_collision_pairs_numpy_norm(positions: npt.NDArray, radii: npt.NDArray) -
     return collisions
 
 
-def get_collision_pairs_distance_squared(positions: npt.NDArray, radii: npt.NDArray) -> list[tuple[int, int]]:
+def get_collision_pairs_distance_squared(positions: npt.NDArray, radii: npt.NDArray, **_) -> list[tuple[int, int]]:
     """Implementation using distance squared to avoid computing square roots. This method is more efficient for small radii."""
     collisions = []
     num_particles = positions.shape[0]
     for i in range(num_particles):
         for j in range(i + 1, num_particles):
-            x_diff = positions[i, 0] - positions[j, 0]
-            y_diff = positions[i, 1] - positions[j, 1]
-            dist_sq = x_diff**2 + y_diff**2
-            radius_sum = radii[i] + radii[j]
-            if dist_sq < radius_sum**2:
+            if _compare_positions_and_radii(positions[i], positions[j], radii[i], radii[j]):
                 collisions.append((i, j))
+    return collisions
+
+
+def get_collision_pairs_neighbor_list(positions: npt.NDArray, radii: npt.NDArray) -> list[tuple[int, int]]:
+    """
+    Implementation using neighbor lists to detect collisions. This method is more efficient for large numbers of particles.
+
+    We divide the box into a grid of cells and only check for collisions between particles in the same or neighboring cells.
+    For example, given a grid:
+
+    +---+---+---+
+    | 0 | 1 | 2 |
+    +---+---+---+
+    | 3 | 4 | 5 |
+    +---+---+---+
+    | 6 | 7 | 8 |
+    +---+---+---+
+
+    We only check for collisions between particles in the same cell or in adjacent cells (excluding diagonals).
+    So, for cell 4, we check cells 4 (itself), 1, 3, 5, and 7.
+    """
+    collisions = []
+    num_particles = positions.shape[0]
+    cell_size = np.max(radii) * 2
+
+    # Create a grid of cells
+    cells: dict[tuple[int, int], list[int]] = {}
+    for i in range(num_particles):
+        cell_x = int(positions[i, 0] // cell_size)
+        cell_y = int(positions[i, 1] // cell_size)
+        cell_key = (cell_x, cell_y)
+        if cell_key not in cells:
+            cells[cell_key] = []
+        cells[cell_key].append(i)
+
+    # Check for collisions within each cell and neighboring cells
+    for (cell_x, cell_y), particle_indices in cells.items():
+        neighboring_cells = [
+            (cell_x, cell_y),
+            (cell_x - 1, cell_y),
+            (cell_x + 1, cell_y),
+            (cell_x, cell_y - 1),
+            (cell_x, cell_y + 1),
+        ]
+        for neighbor in neighboring_cells:
+            if neighbor in cells:
+                for i in particle_indices:
+                    for j in cells[neighbor]:
+                        if i < j:  # Avoid double checking
+                            if _compare_positions_and_radii(positions[i], positions[j], radii[i], radii[j]):
+                                collisions.append((i, j))
     return collisions
 
 
@@ -163,6 +221,40 @@ class SimulationConfig:
     FILE_HANDLER_TYPE: FileHandlerType = FileHandlerType.CSV
     PAIR_SOLVER: CollisionCheckerAlgorithm = CollisionCheckerAlgorithm.DISTANCE_SQUARED
     COLLISION_RESOLVER: int = 1
+
+
+# =============================================================================================================
+# Performance monitoring functions
+# =============================================================================================================
+
+
+def monitor_system_stats() -> dict[str, float | int | dict[str, float]]:
+    """
+    Monitors system statistics such as memory usage, CPU load, and thread count.
+
+    :return: A dictionary containing system statistics.
+    :rtype: dict
+    """
+    process = psutil.Process()
+    stats = {
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
+        "memory_percent": process.memory_percent(),
+        "num_threads": process.num_threads(),
+        "io_counters": process.io_counters()._asdict() if process.io_counters() else {},
+    }
+    return stats
+
+
+def log_system_stats(stats: dict[str, float | int | dict[str, float]], step: int, file: pl.Path) -> None:
+    """
+    Logs system statistics to the performance log file.
+
+    :param step: The current simulation step.
+    :type step: int
+    """
+    stats = monitor_system_stats()
+    with open(file, "a") as f:
+        f.write(f"Step {step}: {stats}\n")
 
 
 # =============================================================================================================
@@ -218,6 +310,10 @@ class ParticleSimulation:
         pl.Path(self.output_dir / "settings.txt").write_text("\n".join([f"{key}: {value}" for key, value in vars(config).items()]))
 
     def __enter__(self):
+        # Delete the existing performance log file if it exists
+        performance_log_file = self.output_dir / "performance_log.txt"
+        if performance_log_file.exists():
+            performance_log_file.unlink()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -228,7 +324,7 @@ class ParticleSimulation:
             self.output_dir.rmdir()
 
         # Log the performance metrics of the simulation
-        with open(self.output_dir / "performance_log.txt", "w") as f:
+        with open(self.output_dir / "performance_log.txt", "a") as f:
             f.write(f"Total elapsed time: {self.total_elapsed_time} seconds\n")
             f.write(f"Average time per step: {self.total_elapsed_time / (self.file_counter if self.file_counter > 0 else 1)} seconds\n")
 
@@ -306,10 +402,8 @@ class ParticleSimulation:
         """
         Checks for collisions among particles in the simulation.
 
-        The method iterates through all pairs of particles and computes the distance
-        between their positions. If the distance between two particles is less than
-        the sum of their radii, it identifies a collision and stores the pair of indices
-        representing the colliding particles.
+        The implementation is determined by the selected collision pair solver algorithm.
+        It returns always a list of tuples where each tuple contains the indices of two particles that are colliding.
         """
         return self.pair_solver(self.positions, self.radii)
 
@@ -424,6 +518,8 @@ class ParticleSimulation:
         else:
             for step in range(num_steps):
                 self.move(step)
+                # Log system stats at each step
+                log_system_stats(monitor_system_stats(), step, self.output_dir / "performance_log.txt")
 
         print(f"\nTotal elapsed time: {self.total_elapsed_time} seconds")
         print(f"Average time per step: {self.total_elapsed_time / num_steps} seconds")
@@ -460,7 +556,7 @@ def main():
     # Add arguments
     parser.add_argument("--animate", type=str, required=False, help="1 if simulations should be animated, 0 otherwise")
     parser.add_argument("--file_handler", type=str, required=False, default="HDF5", help="Type of file handler to use: CSV or HDF5")
-    parser.add_argument("--pair_solver", type=str, required=False, default="DISTANCE_SQUARED", help="Algorithm to use for collision pair finding: NUMPY_NORM or DISTANCE_SQUARED")
+    parser.add_argument("--pair_solver", type=str, required=False, default="NEIGHBOR_LIST", help="Algorithm to use for collision pair finding: NUMPY_NORM, DISTANCE_SQUARED, or NEIGHBOR_LIST")
     args = parser.parse_args()
 
     config = SimulationConfig()
@@ -469,7 +565,7 @@ def main():
     # Animation
     # -----------------------------------------------------------------------------------------
 
-    ANIMATE = True
+    ANIMATE = False
 
     # -----------------------------------------------------------------------------------------
     # Select file handler based on argument
@@ -491,6 +587,7 @@ def main():
 
     _collision_pair_finder_register[CollisionCheckerAlgorithm.NUMPY_NORM] = get_collision_pairs_numpy_norm
     _collision_pair_finder_register[CollisionCheckerAlgorithm.DISTANCE_SQUARED] = get_collision_pairs_distance_squared
+    _collision_pair_finder_register[CollisionCheckerAlgorithm.NEIGHBOR_LIST] = get_collision_pairs_neighbor_list
 
     if args.pair_solver.upper() not in CollisionCheckerAlgorithm.__members__:
         print(f"Error! Unknown collision pair solver algorithm: {args.pair_solver}")
